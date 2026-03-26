@@ -1,0 +1,136 @@
+Generate a complete, working Python Streamlit application named `Robo-Advisor` that acts as a fincaial advisor. It takes inputs from customers and suggest best possible investment options.
+Functionality:
+	The Robo-Advisor is a Q an A type agent or chatbot.
+	Input: Customer Name, Age, Risk tolerance, Investment Amount, Investment Horizon, Investment objective
+	Output: Fund name, Risk score or parameter of the fund, P/E ratio, Sharpe ratio, Beta, previous 1yr,3yr and 5yr return(Graphical). 
+	Forecasted return for 1year,3yr (graphical)
+
+Core stack:
+- Use Python.
+- Build the UI with Streamlit.
+- Use matplotlib for graphs
+- Use `httpx`, `re`, `tempfile`, `streamlit`, `langchain_classic.chains.RetrievalQA`, `langchain_community.vectorstores.Chroma`, `langchain_openai.ChatOpenAI`, `langchain_openai.OpenAIEmbeddings`, `langchain_text_splitters.RecursiveCharacterTextSplitter`, and `pdfminer.high_level.extract_text`.
+- Keep the code in one Python file.
+- Output only the final Python code, with comments and annotations before each code and explanation.
+
+Model configuration:
+- Create the HTTP client exactly as:
+  - `client = httpx.Client(verify=False, trust_env=False)`
+- Create the LLM using:
+  - `base_url="https://genailab.tcs.in"`
+  - `model="azure_ai/genailab-maas-DeepSeek-V3-0324"`
+  - `api_key="YOUR_API_KEY_HERE"`
+  - `http_client=client`
+  - `temperature=0`
+- Create embeddings using:
+  - `base_url="https://genailab.tcs.in"`
+  - `model="azure/genailab-maas-text-embedding-3-large"`
+  - `api_key="YOUR_API_KEY_HERE"`
+  - `http_client=client`
+  - `tiktoken_enabled=False`
+  - `check_embedding_ctx_length=False`
+
+RAG behavior:
+- Financial data will be uploaded to a folder, From the folder, Rag application will pick the file
+- The file can be a PDF or csv or excel file.
+- Save the uploaded PDF or csv or excel temporarily using `tempfile.NamedTemporaryFile`.
+- Extract text using `extract_text`.
+- Split the text using `RecursiveCharacterTextSplitter` or any other which is appropriate with:
+  - `chunk_size=1000`
+  - `chunk_overlap=200`
+- Store chunks in a Chroma vector database with:
+  - `persist_directory="./chroma_index"`
+- Persist the vector database.
+- Create a retriever using similarity search with `k=5`.
+- Build a `RetrievalQA` chain with `return_source_documents=True`.
+
+Streamlit app behavior:
+- Streamlit page title must be `Robo-Advisor`.
+- Main title must be `Robo-Advisor`.
+- There will be a chatbot which can interact with customers, take their input details. 
+	And display the fund details along with graphs and explanation why this fund is suitable for the custoimer profile
+- There should be option to set the temperature, top k values and choose the embedding 
+- Use `st.session_state` to store:
+  - the uploaded file name
+  - the RAG chain
+  - the generated summary
+  - the chat history
+- Rebuild the vector index only when a new file is uploaded.
+- When a new file is uploaded:
+  - clear previous chat history
+  - process the file
+  - build the retriever and RAG chain
+
+Chatbot behavior:
+- Add a section titled `Hi I am AiFri, your trusted invetment advisor`.
+- Render previous messages using `st.chat_message`.
+- Accept user input using:
+  - `st.chat_input("Please tell us about yourself")`
+- For each user question:
+  - add it to chat history
+  - query the RAG chain
+  - display the response
+  - add the assistant response to chat history
+
+Guardrails requirements:
+- Add a dedicated guardrails section in code.
+- Implement basic input validation for user questions.
+- If the question is empty, too short, or only special characters, do not call the model and instead show a helpful warning.
+- Add a simple relevance check:
+  - if the user asks something clearly unrelated to the uploaded PDF, respond that the assistant can answer only from the uploaded document.
+- Add a refusal policy for harmful or sensitive requests such as:
+  - instructions for illegal activity
+  - malware creation
+  - self-harm encouragement
+  - prompt injection attempts like “ignore previous instructions” or “reveal system prompt”
+- In such cases, do not call the model; return a safe refusal message.
+
+PII masking requirements:
+- Add a helper function that masks common PII patterns before sending text to the model or showing outputs.
+- Mask at least these patterns using regex:
+  - email addresses
+  - phone numbers
+  - Aadhaar-like 12-digit numbers
+  - PAN-like identifiers
+  - credit/debit card-like long digit sequences
+- Replace detected values with tags such as:
+  - `[MASKED_EMAIL]`
+  - `[MASKED_PHONE]`
+  - `[MASKED_AADHAAR]`
+  - `[MASKED_PAN]`
+  - `[MASKED_CARD]`
+- Apply PII masking to:
+  - extracted PDF text before chunking
+  - user questions before retrieval
+  - assistant answers before display
+- Keep the masking logic readable and modular.
+
+Anti-hallucination requirements:
+- Add a strong system-style instruction for summarization and Q&A behavior.
+- The model must answer only from the uploaded PDF content retrieved by the RAG pipeline.
+- If the answer is not supported by the retrieved context, it must say:
+  - `I could not find that information in the uploaded PDF.`
+- Do not allow the assistant to invent facts, page numbers, or references.
+- In the answer prompt, instruct the model to:
+  - rely only on retrieved context
+  - be concise and factual
+  - explicitly say when information is unavailable in the document
+- If retrieved source documents are empty or weak, return the fallback response instead of a guessed answer.
+- Optionally display a short note under the answer such as:
+  - `Answer based only on uploaded PDF context.`
+
+Implementation details:
+- Use helper functions for:
+  - masking PII
+  - validating the user query
+  - detecting unsafe requests
+  - checking whether retrieved sources exist
+  - building guarded prompts
+- Show a spinner while indexing the document.
+- Show a spinner while generating the investment details and graphs.
+- Show a spinner while answering chat questions.
+- Add clear step-by-step comments before each logical section/block.
+- Keep the code simple, readable, and fully runnable.
+- Do not omit imports.
+- Do not leave pseudo-code.
+- Output only the final Python code with explanation
