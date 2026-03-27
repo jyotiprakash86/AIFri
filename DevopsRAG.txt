@@ -1,0 +1,367 @@
+import streamlit as st
+from typing import TypedDict, List, Union
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.graph import StateGraph, START, END
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.chains.retrieval_qa.base import RetrievalQA
+from pdfminer.high_level import extract_text
+import tempfile
+import os
+import httpx
+import tiktoken
+import time
+import pyttsx3
+
+# Configuration
+st.set_page_config(page_title = 'Life Science Doc Summarizer', layout = 'wide')
+# tiktoken_cache_dir = "./token"
+# os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
+client = httpx.Client(verify=False)
+# encoding = tiktoken.get_encoding("cl100k_base")
+
+# Voice function
+def tts_speak(text:str):
+    if not text.strip():
+        return
+    
+    engine = pyttsx3.init()
+    engine.say(text)
+    engine.runAndWait()
+
+# Session State Initialization
+if "messages" not in st.session_state:
+
+    # system prompt
+    System_prompt = (
+        '''
+        You are an AI-powered DevOps Incident Response Summarization Agent.
+
+Your role is to analyze incident-related data (incident reports, logs, chat transcripts, and post-mortems) and produce clear, structured, and actionable summaries for engineering and operations teams.
+
+-----------------------------------
+🎯 OBJECTIVES
+-----------------------------------
+1. Summarize incidents into concise, structured reports (~200–300 words)
+2. Extract key insights:
+   - Problem description
+   - Root cause
+   - Actions taken
+   - Impact
+   - Preventive recommendations
+3. Normalize inconsistent or unstructured input into a consistent format
+4. Prioritize clarity, accuracy, and actionability
+
+-----------------------------------
+📄 OUTPUT FORMAT (STRICT)
+-----------------------------------
+Return output in Markdown format:
+
+## Incident Summary
+
+**Incident ID:** <if available>
+**Severity:** <Low/Medium/High/Critical>
+**Affected Services:** <list>
+**Timeline:** <key timestamps if available>
+
+### Problem Description
+<brief description>
+
+### Root Cause Analysis
+<clear explanation or "Unknown" if not determinable>
+
+### Actions Taken
+- <bullet points>
+
+### Impact
+- <user/business/system impact>
+
+### Recommendations
+- <preventive steps>
+- <monitoring or alert improvements>
+- <process improvements>
+
+-----------------------------------
+🛡️ GUARDRAILS & SAFETY RULES
+-----------------------------------
+
+1. ❗ NO HALLUCINATIONS
+- Do NOT invent facts
+- If data is missing, explicitly say:
+  "Information not available"
+
+2. 🔍 SOURCE-BOUND REASONING
+- Only use the provided input
+- Do not assume unseen system behavior
+
+3. 🔒 DATA PRIVACY
+- Remove or anonymize:
+  - Emails
+  - IP addresses
+  - Usernames
+  - API keys
+- Replace with placeholders like:
+  <REDACTED_EMAIL>, <REDACTED_IP>
+
+4. ⚠️ UNCERTAINTY HANDLING
+- If root cause is unclear:
+  State: "Root cause could not be conclusively determined"
+
+5. 🚫 NO SENSITIVE LEAKAGE
+- Do not expose credentials, secrets, or internal tokens
+- Mask any detected secrets automatically
+
+6. 🧹 NORMALIZATION
+- Convert messy logs/chat into readable summaries
+- Deduplicate repeated events
+
+7. 📊 PRIORITIZATION
+- Focus on high-severity signals over noise
+- Highlight critical failures and recovery steps
+
+8. ⛔ NO IRRELEVANT CONTENT
+- Do not include jokes, opinions, or unrelated commentary
+
+-----------------------------------
+🧪 INPUT TYPES YOU MAY RECEIVE
+-----------------------------------
+- Raw logs
+- Slack/Email conversations
+- Incident reports
+- JSON/YAML structured data
+- Partial or incomplete data
+
+-----------------------------------
+⚙️ EDGE CASE HANDLING
+-----------------------------------
+- If input is empty → respond:
+  "No incident data provided"
+- If multiple incidents detected → summarize separately
+- If timestamps are inconsistent → order events logically
+
+-----------------------------------
+🎯 STYLE GUIDELINES
+-----------------------------------
+- Clear, professional, and concise
+- Avoid overly technical jargon unless necessary
+- Use bullet points where helpful
+- Keep total length under 300 words
+
+-----------------------------------
+✅ SUCCESS CRITERIA
+-----------------------------------
+A good response:
+- Is structured and readable
+- Contains no fabricated information
+- Highlights actionable insights
+- Can be directly used in reports or dashboards'''
+    )
+    st.session_state.messages = [SystemMessage(content=System_prompt)]
+
+# rag initialization
+if "rag_chain" not in st.session_state:
+    st.session_state.rag_chain = None
+if "rag_ready" not in st.session_state:
+    st.session_state.rag_ready = False
+if "expecting_pdf" not in st.session_state:
+    st.session_state.expecting_pdf = False
+
+st.markdown("""
+    <style>
+    /* background of the UI*/
+    .stApp{
+        background-color: #f8fafc;
+    }
+    
+    /* Title */
+    .title {
+        text-align: center;
+        font-size: 2rem;
+        font-weight: bold;
+        margin-bottom: 20px;
+    }
+            
+    /* Chat container */
+    .chat-container{
+        max-height: 500px;
+        overflow-y: auto;
+        padding: 10px;
+    }
+            
+    /* user message */
+    .user-msg{
+        float: right;
+        text-align: right;
+        background-color: #e0f2fe;
+        padding: 10px 15px;
+        border-radius: 12px;
+        margin: 8px 0;
+        max-width: 80%;
+    }
+            
+    /* ai message */
+    .ai-msg{
+        float: left;
+        text-align: left;
+        background-color: #d9f9d9;
+        padding: 10px 15px;
+        border-radius: 12px;
+        margin: 8px 0;
+        max-width: 80%;
+        margin-left: auto;
+    }
+    </style>
+""", unsafe_allow_html = True)
+
+# Displaying Chat
+def display_chat(messages: List[Union[HumanMessage,AIMessage,SystemMessage]]):
+    st.markdown("Chat History: ")
+    # last 3 interaction
+    recent_msg = [msg for msg in messages if not isinstance(msg,SystemMessage)][-6:]
+    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+    for msg in recent_msg:
+        if isinstance(msg, HumanMessage):
+            st.markdown(f"<div class='user-msg'><b>YOU:</b><br>{msg.content}</div>", unsafe_allow_html=True)
+        elif isinstance(msg, AIMessage):
+            st.markdown(f"<div class='ai-msg'><b>AI:</b><br>{msg.content}</div>", unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html = True)
+    st.markdown('<div id="chat-end"></div>', unsafe_allow_html=True)
+
+    # Auto scroll for new chat
+    st.markdown("""
+        <script>
+            const chatEnd = document.getElementById("chat-end");
+            if (chatEnd){
+                chatEnd.scrollIntoView({ behaviour: "smooth"});
+            }
+        </script>
+""", unsafe_allow_html = True)
+    
+# Detect if rag keyword is present
+def last_user_message_contains_keywords(keywords):
+    for msg in reversed(st.session_state.messages):
+        if isinstance(msg, HumanMessage):
+            content_lower = msg.content.lower()
+            return any(k in content_lower for k in keywords)
+    return False
+
+st.title("RAG powered Life Science Doc Summarizer")
+rag_keywords = ["pdf","summarize","summarizer","document","extract"]
+
+# display function call
+display_chat(st.session_state.messages)
+
+if "pending_tts" in st.session_state and st.session_state.pending_tts:
+    tts_speak(st.session_state.pending_tts)
+    st.session_state.pending_tts = None
+
+# when rag is not ready but pdf is uploaded
+if st.session_state.expecting_pdf and not st.session_state.rag_ready:
+    st.subheader("Upload a PDF file")
+    tts_speak("Please Upload your file below")
+    uploaded_file = st.file_uploader("Upload here", type="pdf")
+    flag = True
+
+    if uploaded_file and flag:
+        with tempfile.NamedTemporaryFile(delete = False, suffix=".pdf") as tmp:
+            tmp.write(uploaded_file.read())
+            tmp_pdf_path = tmp.name
+
+        with st.spinner("Extracting and processing PDF"):
+            raw_text = extract_text(tmp_pdf_path)
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size = 800, chunk_overlap = 200)
+            chunks = text_splitter.split_text(raw_text)
+            print("in extraction")
+            # Embedding model
+            embedding_model = OpenAIEmbeddings(
+                base_url = "https://genailab.tcs.in",
+                model = "azure/genailab-maas-text-embedding-3-large",
+                api_key = "sk-NSv6u2rCE44tzwp8WhMvLw",
+                http_client = client
+            )
+
+            vectordb = Chroma.from_texts(chunks, embedding_model, persist_directory="./chroma_devops_1")
+            vectordb.persist()
+
+            #LLM model
+            llm = ChatOpenAI(
+                base_url = "https://genailab.tcs.in",
+                model = "azure/genailab-maas-gpt-35-turbo",
+                api_key = "sk-NSv6u2rCE44tzwp8WhMvLw",
+                http_client = client
+            )
+
+            retriever = vectordb.as_retriever()
+            rag_chain = RetrievalQA.from_chain_type(
+                llm = llm,
+                retriever = retriever,
+                return_source_documents=True
+            )
+
+            st.session_state.rag_chain = rag_chain
+            st.session_state.rag_ready = True
+            st.success("PDF processed! You can ask questions about it below")
+            st.success("If you have any questions beyond the PDF- related queries,"
+            "please click switch to chatbot to continue the conversation")
+            st.session_state.expecting_pdf = False
+            flag = False
+
+#input from user
+if st.session_state.rag_ready:
+    prompt = st.chat_input("Ask a question about the uploaded PDF")
+    if prompt:
+        st.session_state.messages.append(HumanMessage(content=prompt))
+
+        with st.spinner("Processing your query"):
+            result = st.session_state.rag_chain.invoke(prompt)
+            answer = result["result"]
+            print(answer)
+            st.session_state.messages.append(AIMessage(content=answer))
+        st.rerun()
+    if st.button("Switch to chatbot mode"):
+        st.session_state.rag_ready = False
+        st.session_state.rag_chain = None
+        st.session_state.expecting_pdf = False
+        st.rerun()
+
+else:
+    prompt = st.chat_input("Ask me anything...")
+    if prompt:
+        st.session_state.messages.append(HumanMessage(content=prompt))
+        if any(keyword in prompt.lower() for keyword in rag_keywords):
+            st.session_state.expecting_pdf = True
+            st.rerun()
+
+        else:
+            chat = ChatOpenAI(
+                base_url = "https://genailab.tcs.in",
+                model = "azure/genailab-maas-gpt-35-turbo",
+                api_key = "sk-NSv6u2rCE44tzwp8WhMvLw",
+                http_client = client
+            )
+
+            class AgentState(TypedDict):
+                messages: List[Union[HumanMessage, AIMessage, SystemMessage]]
+            
+            def first_node(state: AgentState)->AgentState:
+                response = chat.invoke(state["messages"])
+                state["messages"].append(AIMessage(content=response.content))
+                return state
+
+            graph = StateGraph(AgentState)
+            graph.add_node("node1",first_node)
+            graph.add_edge(START,"node1")
+            graph.add_edge("node1",END)
+            agent = graph.compile()
+
+            state_input = {"messages": st.session_state.messages.copy()}
+
+            with st.spinner("Have a sip of coffee, Your query is being processed"):
+                result = agent.invoke(state_input)
+                response = result["messages"][-1].content
+
+            st.session_state.messages.append(AIMessage(content=response))
+            st.session_state.pending_tts = response
+            st.rerun()
